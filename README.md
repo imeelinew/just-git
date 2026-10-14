@@ -22,6 +22,8 @@ Create `~/.config/just-git/config.json` (or `$XDG_CONFIG_HOME/just-git/config.js
 
 For DeepSeek or APIs supporting its thinking parameter, add `"thinking": "enabled"` or `"thinking": "disabled"` to the config. Omit it to use the provider's default. It is sent as `{"thinking":{"type":"enabled"}}` or `{"thinking":{"type":"disabled"}}`.
 
+Set `"reasoning_effort": "low"`, `"high"`, or `"max"` for DeepSeek; other providers accept their own effort values. Omit it to use the provider's default. When `thinking` is `disabled`, no effort parameter is sent.
+
 ## Use
 
 ```sh

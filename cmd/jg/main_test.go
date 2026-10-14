@@ -218,7 +218,7 @@ func TestConfigOverrides(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "just-git"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	writeTest(t, filepath.Join(dir, "just-git", "config.json"), `{"base_url":"http://local/v1","api_key":"file-key","model":"file-model","thinking":"disabled"}`)
+	writeTest(t, filepath.Join(dir, "just-git", "config.json"), `{"base_url":"http://local/v1","api_key":"file-key","model":"file-model","thinking":"disabled","reasoning_effort":"high"}`)
 	t.Setenv("JG_BASE_URL", "http://override/v1")
 	t.Setenv("JG_API_KEY", "")
 	t.Setenv("JG_MODEL", "override-model")
@@ -226,35 +226,45 @@ func TestConfigOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.BaseURL != "http://override/v1" || c.APIKey != "" || c.Model != "override-model" || c.Thinking != "disabled" {
+	if c.BaseURL != "http://override/v1" || c.APIKey != "" || c.Model != "override-model" || c.Thinking != "disabled" || c.ReasoningEffort != "high" {
 		t.Fatalf("%+v", c)
 	}
 }
 
 func TestThinkingModes(t *testing.T) {
 	for _, mode := range []string{"", "enabled", "disabled"} {
-		t.Run("mode="+mode, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var body map[string]json.RawMessage
-				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-					t.Error(err)
-				}
-				value, exists := body["thinking"]
-				if mode == "" {
-					if exists {
-						t.Error("Default mode must omit thinking")
+		for _, effort := range []string{"", "low", "high", "max", "medium"} {
+			t.Run("mode="+mode+"/effort="+effort, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var body map[string]json.RawMessage
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
 					}
-				} else if string(value) != `{"type":"`+mode+`"}` {
-					t.Errorf("Unexpected thinking parameter: %s", value)
+					value, exists := body["thinking"]
+					if mode == "" {
+						if exists {
+							t.Error("Default mode must omit thinking")
+						}
+					} else if string(value) != `{"type":"`+mode+`"}` {
+						t.Errorf("Unexpected thinking parameter: %s", value)
+					}
+					value, exists = body["reasoning_effort"]
+					if mode == "disabled" || effort == "" {
+						if exists {
+							t.Error("Effort must be omitted")
+						}
+					} else if string(value) != `"`+effort+`"` {
+						t.Errorf("Unexpected reasoning effort: %s", value)
+					}
+					w.Write([]byte(`{"choices":[{"message":{"reasoning_content":"Internal reasoning","content":"Add configurable thinking mode"}}]}`))
+				}))
+				defer server.Close()
+				message, err := generate(context.Background(), server.Client(), config{BaseURL: server.URL, Model: "test", Thinking: mode, ReasoningEffort: effort}, "diff")
+				if err != nil || message != "Add configurable thinking mode" {
+					t.Fatalf("message=%q error=%v", message, err)
 				}
-				w.Write([]byte(`{"choices":[{"message":{"reasoning_content":"Internal reasoning","content":"Add configurable thinking mode"}}]}`))
-			}))
-			defer server.Close()
-			message, err := generate(context.Background(), server.Client(), config{BaseURL: server.URL, Model: "test", Thinking: mode}, "diff")
-			if err != nil || message != "Add configurable thinking mode" {
-				t.Fatalf("message=%q error=%v", message, err)
-			}
-		})
+			})
+		}
 	}
 }
 
