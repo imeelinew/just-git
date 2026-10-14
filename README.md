@@ -20,6 +20,8 @@ Create `~/.config/just-git/config.json` (or `$XDG_CONFIG_HOME/just-git/config.js
 
 `JG_BASE_URL`, `JG_API_KEY`, and `JG_MODEL` override the file. The base URL must include the API version path when required. The key is optional for local servers.
 
+For DeepSeek or APIs supporting its thinking parameter, add `"thinking": "enabled"` or `"thinking": "disabled"` to the config. Omit it to use the provider's default. It is sent as `{"thinking":{"type":"enabled"}}` or `{"thinking":{"type":"disabled"}}`.
+
 ## Use
 
 ```sh
