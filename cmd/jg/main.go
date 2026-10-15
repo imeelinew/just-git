@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const usage = `Usage: jg <commit|push>
@@ -88,6 +89,8 @@ func git(ctx context.Context, dir string, stdout, stderr io.Writer, args ...stri
 }
 
 func generate(ctx context.Context, client *http.Client, c config, diff string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 	type thinkingMode struct {
 		Type string `json:"type"`
 	}
@@ -180,6 +183,7 @@ func run(ctx context.Context, dir string, args []string, stdout, stderr io.Write
 	if err != nil {
 		return err
 	}
+	fmt.Fprintln(stdout, "Generating commit message...")
 	message, err := generate(ctx, http.DefaultClient, c, diff.String())
 	if err != nil {
 		return err

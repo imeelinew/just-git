@@ -39,7 +39,7 @@ Messages are short English imperative subjects, without a prefix or body:
 Simplify clipboard state and transfer handling
 ```
 
-The staged diff is sent to your configured API. Ignored files stay ignored. Failed generation leaves changes staged. Git errors pass through unchanged. A failed push leaves the local commit intact; retry with `git push`.
+The staged diff is sent to your configured API. Generation shows a status line and times out after 60 seconds. Ignored files stay ignored. Failed generation leaves changes staged. Git errors pass through unchanged. A failed push leaves the local commit intact; retry with `git push`.
 
 ## Development
 

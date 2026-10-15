@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func gitTest(t *testing.T, dir string, args ...string) string {
@@ -276,5 +278,27 @@ func TestInvalidMessages(t *testing.T) {
 		if err == nil {
 			t.Fatalf("Accepted %s", response)
 		}
+	}
+}
+
+func TestGenerationTimeout(t *testing.T) {
+	for _, flushHeaders := range []bool{false, true} {
+		t.Run(fmt.Sprintf("headers=%t", flushHeaders), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				if flushHeaders {
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+				}
+				<-r.Context().Done()
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			_, err := generate(ctx, server.Client(), config{BaseURL: server.URL, Model: "test"}, "diff")
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Expected deadline exceeded, got %v", err)
+			}
+		})
 	}
 }
