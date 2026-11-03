@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -261,7 +265,7 @@ func TestThinkingModes(t *testing.T) {
 					w.Write([]byte(`{"choices":[{"message":{"reasoning_content":"Internal reasoning","content":"Add configurable thinking mode"}}]}`))
 				}))
 				defer server.Close()
-				message, err := generate(context.Background(), server.Client(), config{BaseURL: server.URL, Model: "test", Thinking: mode, ReasoningEffort: effort}, "diff")
+				message, err := generate(context.Background(), server.Client(), config{providerConfig: providerConfig{BaseURL: server.URL, Model: "test", Thinking: mode, ReasoningEffort: effort}}, "diff")
 				if err != nil || message != "Add configurable thinking mode" {
 					t.Fatalf("message=%q error=%v", message, err)
 				}
@@ -273,7 +277,7 @@ func TestThinkingModes(t *testing.T) {
 func TestInvalidMessages(t *testing.T) {
 	for _, response := range []string{`{"choices":[]}`, `{"choices":[{"message":{"content":""}}]}`, `{"choices":[{"message":{"content":"Title\nBody"}}]}`} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(response)) }))
-		_, err := generate(context.Background(), server.Client(), config{BaseURL: server.URL, Model: "test"}, "diff")
+		_, err := generate(context.Background(), server.Client(), config{providerConfig: providerConfig{BaseURL: server.URL, Model: "test"}}, "diff")
 		server.Close()
 		if err == nil {
 			t.Fatalf("Accepted %s", response)
@@ -295,10 +299,174 @@ func TestGenerationTimeout(t *testing.T) {
 			defer server.Close()
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
-			_, err := generate(ctx, server.Client(), config{BaseURL: server.URL, Model: "test"}, "diff")
+			_, err := generate(ctx, server.Client(), config{providerConfig: providerConfig{BaseURL: server.URL, Model: "test"}}, "diff")
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("Expected deadline exceeded, got %v", err)
 			}
 		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestProviderFallback(t *testing.T) {
+	for _, status := range []int{200, 400, 401, 403, 404, 408, 413, 422, 429, 500, 502, 503, 504} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			primaryCalls, fallbackCalls := 0, 0
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				primaryCalls++
+				w.WriteHeader(status)
+				io.WriteString(w, `{"choices":[{"message":{"content":"Use primary provider"}}]}`)
+			}))
+			defer primary.Close()
+			fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fallbackCalls++
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer backup-key" || string(body["model"]) != `"backup-model"` || string(body["thinking"]) != `{"type":"disabled"}` {
+					t.Errorf("Fallback did not use its own configuration: %s %v", r.URL.Path, body)
+				}
+				if _, ok := body["reasoning_effort"]; ok {
+					t.Error("Leaked primary reasoning effort")
+				}
+				io.WriteString(w, `{"choices":[{"message":{"content":"Use fallback provider"}}]}`)
+			}))
+			defer fallback.Close()
+			c := config{
+				providerConfig: providerConfig{BaseURL: primary.URL, Model: "primary", Thinking: "enabled", ReasoningEffort: "high"},
+				Fallback:       &providerConfig{BaseURL: fallback.URL + "/v1", APIKey: "backup-key", Model: "backup-model", Thinking: "disabled"},
+			}
+			for i := 0; i < 2; i++ {
+				var progress bytes.Buffer
+				message, err := generateWithFallback(context.Background(), primary.Client(), c, "diff", &progress)
+				switch {
+				case status == 200:
+					if err != nil || message != "Use primary provider" {
+						t.Fatalf("%q %v", message, err)
+					}
+				case status == 408 || status >= 500:
+					if err != nil || message != "Use fallback provider" || !strings.Contains(progress.String(), "trying fallback") {
+						t.Fatalf("%q %v %s", message, err, &progress)
+					}
+				default:
+					if err == nil {
+						t.Fatal("Expected primary error")
+					}
+				}
+			}
+			wantFallback := 0
+			if status == 408 || status >= 500 {
+				wantFallback = 2
+			}
+			if primaryCalls != 2 || fallbackCalls != wantFallback {
+				t.Fatalf("primary=%d fallback=%d", primaryCalls, fallbackCalls)
+			}
+		})
+	}
+}
+
+func TestFallbackTransportAndCancellation(t *testing.T) {
+	for _, kind := range []string{"connection", "timeout", "body-timeout", "canceled", "parent-deadline", "invalid-request", "invalid-message", "both-fail", "no-fallback"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			if kind == "canceled" || kind == "parent-deadline" {
+				var cancel context.CancelFunc
+				if kind == "canceled" {
+					ctx, cancel = context.WithCancel(ctx)
+				} else {
+					ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				}
+				cancel()
+			}
+			calls := 0
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					switch kind {
+					case "connection", "both-fail", "no-fallback":
+						return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+					case "timeout", "parent-deadline":
+						return nil, context.DeadlineExceeded
+					case "body-timeout":
+						return &http.Response{StatusCode: 200, Body: timeoutBody{}, Header: make(http.Header)}, nil
+					case "canceled":
+						return nil, context.Canceled
+					case "invalid-request":
+						return nil, errors.New("invalid request header")
+					case "invalid-message":
+						return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"choices":[]}`)), Header: make(http.Header)}, nil
+					}
+				}
+				if r.Context().Err() != nil {
+					t.Error("Fallback inherited expired request context")
+				}
+				if kind == "both-fail" {
+					return nil, errors.New("backup unavailable")
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"Use backup"}}]}`)), Header: make(http.Header)}, nil
+			})}
+			c := config{providerConfig: providerConfig{BaseURL: "http://primary", Model: "primary"}, Fallback: &providerConfig{BaseURL: "http://backup", Model: "backup"}}
+			if kind == "no-fallback" {
+				c.Fallback = nil
+			}
+			message, err := generate(ctx, client, c, "diff")
+			shouldFallback := kind == "connection" || kind == "timeout" || kind == "body-timeout" || kind == "both-fail"
+			wantCalls := 1
+			if shouldFallback {
+				wantCalls = 2
+			}
+			if calls != wantCalls {
+				t.Fatalf("calls=%d want=%d", calls, wantCalls)
+			}
+			if shouldFallback && kind != "both-fail" {
+				if err != nil || message != "Use backup" {
+					t.Fatalf("%q %v", message, err)
+				}
+			} else if err == nil {
+				t.Fatal("Expected error")
+			}
+			if kind == "both-fail" && (!strings.Contains(err.Error(), "connection refused") || !strings.Contains(err.Error(), "backup unavailable")) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+type timeoutBody struct{}
+
+func (timeoutBody) Read([]byte) (int, error) { return 0, context.DeadlineExceeded }
+func (timeoutBody) Close() error             { return nil }
+
+func TestFallbackConfig(t *testing.T) {
+	configureTest(t, "http://primary/v1")
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "just-git")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, fallback := range []string{`null`, `{"base_url":"https://backup/v1","model":"backup","api_key":"backup-key","thinking":"enabled","reasoning_effort":"low"}`, `{}`, `{"base_url":"ftp://backup","model":"backup"}`, `{"base_url":"https://backup","model":"backup","thinking":"invalid"}`} {
+		writeTest(t, filepath.Join(dir, "config.json"), `{"fallback":`+fallback+`}`)
+		c, err := loadConfig()
+		valid := fallback == "null" || strings.Contains(fallback, "backup-key")
+		if valid && err != nil {
+			t.Fatal(err)
+		}
+		if !valid && (err == nil || !strings.HasPrefix(err.Error(), "fallback:")) {
+			t.Fatalf("%s: %v", fallback, err)
+		}
+		if valid && c.Fallback != nil && (c.Fallback.Model != "backup" || c.Fallback.APIKey != "backup-key" || c.Fallback.Thinking != "enabled" || c.Fallback.ReasoningEffort != "low") {
+			t.Fatalf("Unexpected fallback: %+v", c.Fallback)
+		}
+	}
+}
+
+func TestCertificateErrorDoesNotTriggerFallback(t *testing.T) {
+	err := &url.Error{Op: "Post", URL: "https://primary", Err: &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}}
+	var failure *providerFailure
+	if errors.As(transportFailure(err), &failure) {
+		t.Fatal("Certificate error triggered fallback")
 	}
 }
